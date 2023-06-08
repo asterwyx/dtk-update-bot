@@ -1,17 +1,23 @@
 import { Context, Probot, ProbotOctokit } from "probot";
 import { PullRequest } from "@octokit/webhooks-types";
-import { parseDotGitmodulesContent } from "./submodule-parser";
+import { parseDotGitmodulesContent, Submodule } from "./submodule-parser";
 import { BotState, SubmoduleInfo, CommitStatus, defaultCommitStatus } from "./types";
 import assert from "assert";
-import { ExecException } from "child_process";
-
-
+import { ExecException, execSync } from "child_process";
+import { mkdtempSync, rm } from "fs";
+import { chdir } from "process";
+import { tmpdir } from "os";
 class UpdateBot {
   state: BotState;
   currentUpdatePRID: number;
   updatePR: PullRequest | null;
   submoduleInfo: Map<string, SubmoduleInfo>;
   installationId: number;
+  updateToVersion: string | null;
+  updateBase: string;
+  authorLogin: string;
+  authorEmail: string;
+  workDir: string | null;
 
   constructor() {
     this.state = BotState.IDLE;
@@ -19,6 +25,11 @@ class UpdateBot {
     this.updatePR = null;
     this.submoduleInfo = new Map;
     this.installationId = -1;
+    this.updateToVersion = null;
+    this.updateBase = "";
+    this.authorEmail = "";
+    this.authorLogin = "";
+    this.workDir = null;
   }
 
   async checksCompleted(context: Context, PRNumber: number) : Promise<boolean> {
@@ -63,55 +74,52 @@ class UpdateBot {
 
   async PRApproved(context: Context, PRNumber: number) : Promise<boolean> {
     let PR = context.repo({pull_number: PRNumber});
+    const reviewsRes = context.octokit.pulls.listReviews(PR);
     let {data: PRInfo} = await context.octokit.pulls.get(PR);
     let baseRef = PRInfo.base.ref;
-    // Get all pull request reviews for a PR
-    let {data: reviews} = await context.octokit.pulls.listReviews(PR);
-    let findReviewByUser = (user: string) => {
-      for (let review of reviews) {
-        if (review.user?.login === user) {
-          return review;
-        }
-      }
-      return null;
-    }
-    // Get pull request review protection rules
+    let reviewProtection : Awaited<ReturnType<typeof context.octokit.repos.getPullRequestReviewProtection>>;
     try {
-      let {data: reviewProtection} = await context.octokit.repos.getPullRequestReviewProtection(context.repo({branch: baseRef}));
-      if (reviewProtection.require_code_owner_reviews) {
-        let codeOwnerReview = findReviewByUser(PR.owner);
-        if (codeOwnerReview === null || codeOwnerReview.state !== "APPROVED") {
-          return false;
-        }
+      reviewProtection = await context.octokit.repos.getPullRequestReviewProtection(context.repo({branch: baseRef}));
+    } catch (error : any) {
+      let e = error as ExecException;
+      context.log.info(e);
+      return true;
+    }
+    const {data: reviews} = await reviewsRes;
+    if (reviewProtection.data.require_code_owner_reviews) {
+      const found = reviews.find((review) => review.user?.login === PR.owner && review.state === "APPROVED");
+      if (found === undefined) {
+        return false;
       }
-      if (reviewProtection.required_approving_review_count && reviewProtection.required_approving_review_count > 0) {
-        let approvedReviews = 0;
-        let reviewUsers = [];
-        let approvalUsers = [];
-        for (let review of reviews) {
-          let user = review.user?.login;
-          if (user === undefined) {
-            continue;
-          }
-          reviewUsers.push(user);
-          let {status: collaboratorStatus} = await context.octokit.repos.checkCollaborator(context.repo({username: user}) as any);
+    }
+    if (reviewProtection.data.required_approving_review_count && reviewProtection.data.required_approving_review_count > 0) {
+      let approvedReviews = 0;
+      let reviewUsers = [];
+      let approvalUsers = [];
+      for (let review of reviews) {
+        let user = review.user?.login;
+        if (user === undefined) {
+          continue;
+        }
+        reviewUsers.push(user);
+        try {
+          let {status: collaboratorStatus} = await context.octokit.repos.checkCollaborator(context.repo({username: user}));
           if (collaboratorStatus == 204 && review.state === "APPROVED") {
             approvedReviews++;
             approvalUsers.push(user);
           }
-        }
-        context.log.info(`Review users: ${reviewUsers}. Approval users: ${approvalUsers}.`);
-        if (approvedReviews < reviewProtection.required_approving_review_count) {
+        } catch(_) {
           return false;
-        } else {
-          return true;
         }
       }
-      return true;
-    } catch (e: any) {
-      context.log.warn((e as ExecException).name);
-      return false;
+      context.log.info(`Review users: ${reviewUsers}. Approval users: ${approvalUsers}.`);
+      if (approvedReviews < reviewProtection.data.required_approving_review_count) {
+        return false;
+      } else {
+        return true;
+      }
     }
+    return true;
   }
 
   submodulesReady() : boolean {
@@ -133,38 +141,27 @@ class UpdateBot {
     // Make sure bot.submoduleInfo consists to submodules got from dtk
     const octokit = await app.auth(this.installationId);
     let submodules = Array.from(this.submoduleInfo.values());
-    for (let submodule of submodules) {
-      // approve every PR
-      try {
-        await octokit.pulls.createReview({
-          owner: submodule.owner,
-          repo: submodule.repo,
-          pull_number: submodule.commit_status.pull_number,
-          event: "APPROVE"
-        });
-      } catch (e: any) {
-        app.log.error(e);
-        return false;
-      }
-    }
     let allMerged = true;
-    for (let submodule of submodules) {
-      // merge every PR
-      try {
-        let {data: commit} = await octokit.pulls.merge({
-          owner: submodule.owner,
-          repo: submodule.repo,
-          pull_number: submodule.commit_status.pull_number,
-          merge_method: "rebase"
-        });
-        submodule.merged_sha = commit.sha;
-      } catch (e: any) {
+    let promises : ReturnType<typeof octokit.pulls.merge>[] = [];
+    submodules.forEach((submodule) => {
+      let mergePromise = octokit.pulls.merge({
+        owner: submodule.owner,
+        repo: submodule.repo,
+        pull_number: submodule.commit_status.pull_number,
+        merge_method: "rebase"
+      });
+      mergePromise.then((commit) => {
+        submodule.merged_sha = commit.data.sha;
+      }).catch(e => {
         // This operation should be atom, or we schedule a task to complete it soon.
         // In case we lost a packet or the network is down suddenly.
-        allMerged = false;
         app.log.error(e);
-      }
-    }
+      })
+      promises.push(mergePromise);
+    });
+    await Promise.all(promises).catch(_ => {
+      allMerged = false;
+    });
     return allMerged;
   }
 
@@ -195,7 +192,7 @@ class UpdateBot {
     const {data: newCommit} = await octokit.rest.git.createCommit({
       owner: this.updatePR.base.user.login,
       repo: "dtk",
-      message: 'chore: sync repo modules',
+      message: "chore: sync repo modules",
       tree: newTree.sha,
       parents: [this.updatePR.base.sha]
     });
@@ -208,6 +205,14 @@ class UpdateBot {
       force: true
     });
     app.log.info(result);
+    await octokit.repos.createCommitStatus({
+      owner: this.updatePR.base.user.login,
+      repo: "dtk",
+      sha: this.updatePR.head.sha,
+      state: "success",
+      context: "auto-update / update-submodules",
+      description: "Submodules updated successfully"
+    })
     const mergedPR = octokit.pulls.merge({
       owner: this.updatePR.base.user.login,
       repo: "dtk",
@@ -216,11 +221,182 @@ class UpdateBot {
     })
     app.log.info(mergedPR);
   }
+
+  async generateChangelog(submodule: Submodule): Promise<string> {
+    if(!bot.workDir) {
+      bot.workDir = mkdtempSync(`${tmpdir()}/dtk-update-bot-`);
+    }
+    chdir(bot.workDir);
+    execSync(`git clone -b ${submodule.branch} ${submodule.url} ${submodule.path}`);
+    chdir(submodule.path);
+    execSync(`git config user.name "${bot.authorLogin}"`);
+    execSync(`git config user.email "${bot.authorEmail}"`);
+    execSync(`gbp deepin-changelog --spawn-editor=never --distribution=unstable --force-distribution --git-author --ignore-branch -N ${bot.updateToVersion}`);
+    return execSync("cat debian/changelog").toString();
+  }
+
+  async deliverUpdatePR(context: Context<"pull_request">, submodule: Submodule) {
+    let info: SubmoduleInfo = {
+      owner: context.payload.repository.owner.login,
+      repo: submodule.name,
+      repo_url: submodule.url,
+      branch: submodule.branch,
+      merged_sha: "",
+      commit_status: defaultCommitStatus,
+      started_at: new Date()
+    };
+    context.octokit.repos.createCommitStatus({
+      owner: info.owner,
+      repo: "dtk",
+      sha: context.payload.pull_request.head.sha,
+      state: "pending",
+      context: `auto-update / check-update (${info.repo})`,
+      target_url: info.repo_url,
+      description: "Creating pull request for update..."
+    });
+    const topicBranch = 'topic-update';
+    const commitRes = this.generateChangelog(submodule)
+    .then(async (changelogContent) => {
+      context.log.info(changelogContent);
+      const {data: changelogBlob} = await context.octokit.git.createBlob({
+        owner: info.owner,
+        repo: info.repo,
+        content: changelogContent,
+        encoding: "utf-8"
+      });
+      const changelog : {
+        path?: string;
+        mode?: "100644" | "100755" | "040000" | "160000" | "120000";
+        type?: "blob" | "tree" | "commit";
+        sha?: string | null;
+        content?: string;
+      } = {
+        path: 'debian/changelog',
+        mode: '100644',
+        type: 'blob',
+        sha: changelogBlob.sha
+      }
+      const identity = {
+        name: bot.authorLogin,
+        email: bot.authorEmail
+      };
+      const {data: base} = await context.octokit.repos.getBranch({
+        owner: info.owner,
+        repo: info.repo,
+        branch: bot.updateBase
+      });
+      const baseSha = base.commit.sha;
+      const {data: newTree} = await context.octokit.git.createTree({
+        owner: info.owner,
+        repo: info.repo,
+        tree: [changelog],
+        base_tree: baseSha
+      });
+      return context.octokit.git.createCommit({
+        owner: info.owner,
+        repo: info.repo,
+        message: `chore: update changelog\n\nRelease ${bot.updateToVersion}.`,
+        tree: newTree.sha,
+        parents: [baseSha],
+        committer: identity,
+        author: identity
+      });
+    });
+    return context.octokit.git.listMatchingRefs({
+      owner: info.owner,
+      repo: info.repo,
+      ref: `heads/${topicBranch}`
+    }).then(async (matchedRef) => {
+      const found = matchedRef.data.find(matched => matched.ref == `refs/heads/${topicBranch}`)
+      const {data: newCommit} = await commitRes;
+      if (found) {
+        await context.octokit.git.updateRef({
+          owner: info.owner,
+          repo: info.repo,
+          ref: `heads/${topicBranch}`,
+          sha: newCommit.sha,
+          force: true
+        });
+      } else {
+        await context.octokit.git.createRef({
+          owner: info.owner,
+          repo: info.repo,
+          ref: `heads/${topicBranch}`,
+          sha: newCommit.sha
+        });
+      }
+        // create pull request
+      const {data: prs} = await context.octokit.pulls.list({
+        owner: info.owner,
+        repo: info.repo,
+        head: `${info.owner}:${topicBranch}`,
+        base: `${bot.updateBase}`
+      });
+      let prUrl : string;
+      let prNumber : number;
+      if (prs.length === 0) {
+        let {data: pr} = await context.octokit.rest.pulls.create({
+          owner: info.owner,
+          repo: info.repo,
+          title: 'chore: update changelog',
+          body: `Release ${bot.updateToVersion}.`,
+          head: topicBranch,
+          base: bot.updateBase
+        });
+        prUrl = pr.html_url;
+        prNumber = pr.number;
+      } else {
+        prUrl = prs[0].html_url;
+        prNumber = prs[0].number;
+      }
+      // create status
+      await context.octokit.repos.createCommitStatus({
+        owner: info.owner,
+        repo: "dtk",
+        sha: context.payload.pull_request.head.sha,
+        state: "pending",
+        context: `auto-update / check-update (${info.repo})`,
+        target_url: prUrl,
+        description: "Waiting for checks to complete..."
+      });
+      info.commit_status.context = `auto-update / check-update (${info.repo})`;
+      info.commit_status.state = "pending";
+      info.commit_status.description = "Waiting for checks to complete...";
+      info.commit_status.pull_sha = newCommit.sha;
+      info.commit_status.pull_number = prNumber;
+      info.commit_status.pull_url = prUrl;
+      info.commit_status.repo = info.repo;
+      // List workflows for this repo, if there aren't any, then we assume checks are passed
+      // Note that this is insufficient but required. GitHub will return an empty array if there
+      // are no files under .github/workflows or GitHub Actions is not enabled for the repo.
+      // The more accurate way is to detect if there are any checks for this PR. However, there will
+      // be some delay between checks starting and the status event being fired. We may get a wrong result.
+      // Just use a timer to handle this
+      handleEmptyChecks(context.octokit, info).catch((err) => {
+        context.log.error(err);
+      });
+      bot.submoduleInfo.set(submodule.name, info);
+      return info;
+    });
+  }
 };
 
 // Global update bot
 let bot: UpdateBot = new UpdateBot();
 
+function getDurationDescription(ms : number) {
+  const durationInSeconds = ms / 1000;
+  const hours = Math.floor(durationInSeconds / 3600);
+  const minutes = Math.floor((durationInSeconds - hours * 3600) / 60);
+  const seconds = Math.floor(durationInSeconds - hours * 3600 - minutes * 60);
+  if (hours !== 0) {
+    return `${hours}h${minutes}m${seconds}s`;
+  } else if (minutes !== 0) {
+    return `${minutes}m${seconds}s`;
+  } else {
+    return `${seconds}s`;
+  }
+}
 async function handleEmptyChecks(octokit: InstanceType<typeof ProbotOctokit>, submoduleInfo: SubmoduleInfo) {
   return new Promise<Awaited<ReturnType<typeof octokit.repos.createCommitStatus>>> ((resolve, reject) =>
     setTimeout(async () => {
@@ -273,7 +449,7 @@ async function parseCommitStatus(context: Context<"status">) : Promise<CommitSta
           state: context.payload.state,
           pull_number: pullNumber,
           pull_sha: PRInfo.head.sha,
-          pull_url: context.payload.target_url
+          pull_url: context.payload.target_url,
         };
         return status;
       }
@@ -287,11 +463,48 @@ async function parseCommitStatus(context: Context<"status">) : Promise<CommitSta
 export = (app: Probot) => {
   app.on(["pull_request.opened", "pull_request.reopened", "pull_request.synchronize"], async (context) => {
     if (context.payload.repository.name === "dtk") {
-      bot.state = BotState.UPDATING;
       if (context.payload.installation === undefined) {
         return;
       }
-      bot.installationId = context.payload.installation.id;
+      const {data: files} = await context.octokit.pulls.listFiles(context.pullRequest());
+      const changelog = files.find(file => file.filename === "debian/changelog");
+      if (changelog === undefined || changelog.patch === undefined) {
+        return;
+      }
+      const versionPattern = /\+dtk\s\((?<version>\d+(\.\d+)*)\)/;
+      const result = versionPattern.exec(changelog.patch);
+      if (result === null || result.groups === undefined) {
+        return;
+      }
+      bot.authorLogin = context.payload.pull_request.user.login;
+      const {data: user} = await context.octokit.users.getByUsername({username: bot.authorLogin});
+      if (user.email === null) {
+        context.log.error("Author email is null!");
+        return;
+      }
+      const startTimeRes = context.octokit.repos.createCommitStatus({
+        owner: context.payload.repository.owner.login,
+        repo: "dtk",
+        sha: context.payload.pull_request.head.sha,
+        state: "pending",
+        context: "auto-update / deliver-pr",
+        description: "Delivering pull requests to submodules..."
+      }).then(_ => {
+        return new Date();
+      });
+      context.octokit.repos.createCommitStatus({
+        owner: context.payload.repository.owner.login,
+        repo: "dtk",
+        sha: context.payload.pull_request.head.sha,
+        state: "pending",
+        context: "auto-update / update-submodules",
+        description: "Waiting for submodules to be updated..."
+      })
+      bot.authorEmail = user.email;
+      bot.updateToVersion = result.groups.version;
+      bot.state = BotState.UPDATING;
+      bot.updateBase = context.payload.pull_request.base.ref;
+      bot.installationId = context.payload.installation.id; // save installation id for later use
       bot.currentUpdatePRID = context.payload.number;
       bot.updatePR = context.payload.pull_request;
       // Just build submodule info at this time to ensure submoduleInfo track is correct
@@ -299,18 +512,29 @@ export = (app: Probot) => {
       if ("content" in gitmodules) {
         let gitmodulesContent = Buffer.from(gitmodules.content, gitmodules.encoding as BufferEncoding).toString();
         let submodules = parseDotGitmodulesContent(gitmodulesContent);
+        let delivers : ReturnType<typeof bot.deliverUpdatePR>[] = new Array();
         for (let submodule of submodules) {
-          let info: SubmoduleInfo = {
-            owner: context.payload.repository.owner.login,
-            repo: submodule.name,
-            repo_url: submodule.url,
-            branch: submodule.branch,
-            merged_sha: "",
-            complete: false,
-            commit_status: defaultCommitStatus
-          };
-          bot.submoduleInfo.set(submodule.name, info);
+          delivers.push(bot.deliverUpdatePR(context, submodule));
         }
+        const updateDeliverStatus = async (context: Context<"pull_request">) => {
+          await Promise.all(delivers);
+          const stopTime = new Date();
+          const startTime = await startTimeRes;
+          context.octokit.repos.createCommitStatus({
+            owner: context.payload.repository.owner.login,
+            repo: "dtk",
+            sha: context.payload.pull_request.head.sha,
+            state: "success",
+            context: "auto-update / deliver-pr",
+            description: "Successful in " + getDurationDescription(stopTime.getTime() - startTime.getTime())
+          })
+          if (bot.workDir) {
+            rm(bot.workDir, {recursive: true, force: true}, _ => {
+              context.log.info("Work directory removed.");
+            });
+          }
+        }
+        updateDeliverStatus(context);
       } else {
         context.log.error("gitmodules is a file, response must contain property content.");
       }
@@ -340,8 +564,9 @@ export = (app: Probot) => {
     context.log.info(`PR: ${context.payload.check_run.pull_requests[0].url}`);
     let completed = await bot.checksCompleted(context, context.payload.check_run.pull_requests[0].number);
     if (completed) {
+      let stop_at = new Date();
       context.log.info(`All checks completed for ${context.payload.check_run.pull_requests[0].url}.`);
-      // Update commit status to success
+      // Update commit status to done
       let repo = context.payload.repository.name;
       let updatePR = bot.submoduleInfo.get(repo);
       let state : "error" | "failure" | "pending" | "success" = "pending";
@@ -360,7 +585,8 @@ export = (app: Probot) => {
             sha: bot.updatePR.head.sha,
             state: state,
             context: updatePR.commit_status.context,
-            target_url: updatePR.commit_status.pull_url
+            target_url: updatePR.commit_status.pull_url,
+            description: "Successful in " + getDurationDescription(stop_at.getTime() - updatePR.started_at.getTime())
           });
           if (result.status === 201) {
             updatePR.commit_status.state = "success";
@@ -397,16 +623,6 @@ export = (app: Probot) => {
           bot.logUpdate(app);
         }
         return;
-      } else if(status.state === "pending") {
-        // List workflows for this repo, if there aren't any, then we assume checks are passed
-        // Note that this is insufficient but required. GitHub will return an empty array if there
-        // are no files under .github/workflows or GitHub Actions is not enabled for the repo.
-        // The more accurate way is to detect if there are any checks for this PR. However, there will
-        // be some delay between checks starting and the status event being fired. We may get a wrong result.
-        // Just use a timer to handle this
-        handleEmptyChecks(context.octokit, info).catch((err) => {
-          context.log.error(err);
-        });
       }
     }
   });

@@ -20,7 +20,7 @@ export const defaultCommitStatus: CommitStatus = {
   state: "pending",
   pull_number: 0,
   pull_sha: "",
-  pull_url: ""
+  pull_url: "",
 }
 
 export type SubmoduleInfo = {
@@ -29,6 +29,6 @@ export type SubmoduleInfo = {
   repo_url: string,
   branch: string,
   merged_sha: string,
-  complete: boolean,
-  commit_status: CommitStatus
+  commit_status: CommitStatus,
+  started_at: Date
 };
